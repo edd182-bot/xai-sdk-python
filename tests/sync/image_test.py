@@ -5,6 +5,7 @@ from opentelemetry.trace import SpanKind
 
 from xai_sdk import Client
 from xai_sdk.image import ImageFormat
+from xai_sdk.proto import image_pb2
 
 from .. import server
 
@@ -23,14 +24,16 @@ def image_asset():
 def test_base64(client: Client, image_asset: bytes):
     response = client.image.sample(prompt="foo", model="grok-2-image", image_format="base64")
 
-    assert response.prompt == "foo"
+    with pytest.warns(DeprecationWarning, match="BaseImageResponse.prompt is deprecated"):
+        assert response.prompt == ""
     assert image_asset == response.image
 
 
 def test_url(client: Client, image_asset: bytes):
     response = client.image.sample(prompt="foo", model="grok-2-image", image_format="url")
 
-    assert response.prompt == "foo"
+    with pytest.warns(DeprecationWarning, match="BaseImageResponse.prompt is deprecated"):
+        assert response.prompt == ""
     assert image_asset == response.image
 
 
@@ -40,8 +43,116 @@ def test_batch(client: Client, image_asset: bytes):
     assert len(responses) == 2
 
     for r in responses:
-        assert r.prompt == "foo"
+        with pytest.warns(DeprecationWarning, match="BaseImageResponse.prompt is deprecated"):
+            assert r.prompt == ""
         assert image_asset == r.image
+
+
+def test_sample_passes_aspect_ratio_and_resolution(client: Client):
+    server.clear_last_image_request()
+
+    client.image.sample(
+        prompt="foo",
+        model="grok-2-image",
+        aspect_ratio="1:1",
+        resolution="1k",
+    )
+
+    request = server.get_last_image_request()
+    assert request is not None
+    assert request.HasField("aspect_ratio")
+    assert request.aspect_ratio == image_pb2.ImageAspectRatio.IMG_ASPECT_RATIO_1_1
+    assert request.HasField("resolution")
+    assert request.resolution == image_pb2.ImageResolution.IMG_RESOLUTION_1K
+
+
+def test_sample_batch_passes_aspect_ratio_and_resolution(client: Client):
+    server.clear_last_image_request()
+
+    client.image.sample_batch(
+        prompt="foo",
+        model="grok-2-image",
+        n=2,
+        aspect_ratio="16:9",
+        resolution="1k",
+    )
+
+    request = server.get_last_image_request()
+    assert request is not None
+    assert request.HasField("aspect_ratio")
+    assert request.aspect_ratio == image_pb2.ImageAspectRatio.IMG_ASPECT_RATIO_16_9
+    assert request.HasField("resolution")
+    assert request.resolution == image_pb2.ImageResolution.IMG_RESOLUTION_1K
+
+
+def test_sample_passes_image_url(client: Client):
+    server.clear_last_image_request()
+
+    input_image_url = "https://example.com/image.jpg"
+    client.image.sample(prompt="foo", model="grok-imagine-image", image_url=input_image_url)
+
+    request = server.get_last_image_request()
+    assert request is not None
+    assert request.HasField("image")
+    assert request.image.image_url == input_image_url
+    assert request.image.detail == image_pb2.ImageDetail.DETAIL_AUTO
+
+
+def test_sample_passes_image_urls(client: Client):
+    server.clear_last_image_request()
+
+    input_image_urls = [
+        "https://example.com/image1.jpg",
+        "data:image/jpeg;base64,/9j/4AAQSkZJRg==",
+    ]
+    client.image.sample(prompt="foo", model="grok-imagine-image", image_urls=input_image_urls)
+
+    request = server.get_last_image_request()
+    assert request is not None
+    assert [image.image_url for image in request.images] == input_image_urls
+    assert all(image.detail == image_pb2.ImageDetail.DETAIL_AUTO for image in request.images)
+
+
+def test_sample_batch_passes_image_urls(client: Client):
+    server.clear_last_image_request()
+
+    input_image_urls = [
+        "https://example.com/image1.jpg",
+        "data:image/jpeg;base64,/9j/4AAQSkZJRg==",
+    ]
+    client.image.sample_batch(prompt="foo", model="grok-imagine-image", n=2, image_urls=input_image_urls)
+
+    request = server.get_last_image_request()
+    assert request is not None
+    assert [image.image_url for image in request.images] == input_image_urls
+    assert all(image.detail == image_pb2.ImageDetail.DETAIL_AUTO for image in request.images)
+
+
+def test_sample_rejects_both_image_fields(client: Client):
+    input_image_url = "https://example.com/image.jpg"
+    input_image_urls = ["https://example.com/image1.jpg"]
+
+    with pytest.raises(ValueError, match="Only one of image_url or image_urls can be set"):
+        client.image.sample(
+            prompt="foo",
+            model="grok-imagine-image",
+            image_url=input_image_url,
+            image_urls=input_image_urls,
+        )
+
+
+def test_sample_batch_rejects_both_image_fields(client: Client):
+    input_image_url = "https://example.com/image.jpg"
+    input_image_urls = ["https://example.com/image1.jpg"]
+
+    with pytest.raises(ValueError, match="Only one of image_url or image_urls can be set"):
+        client.image.sample_batch(
+            prompt="foo",
+            model="grok-imagine-image",
+            n=2,
+            image_url=input_image_url,
+            image_urls=input_image_urls,
+        )
 
 
 @mock.patch("xai_sdk.sync.image.tracer")
@@ -60,7 +171,8 @@ def test_sample_creates_span_with_correct_attributes(
     expected_request_attributes = {
         "gen_ai.prompt": "A beautiful sunset",
         "gen_ai.operation.name": "generate_image",
-        "gen_ai.system": "xai",
+        "gen_ai.provider.name": "xai",
+        "gen_ai.output.type": "image",
         "gen_ai.request.model": "grok-2-image",
         "gen_ai.request.image.format": image_format,
         "gen_ai.request.image.count": 1,
@@ -76,7 +188,15 @@ def test_sample_creates_span_with_correct_attributes(
     expected_response_attributes = {
         "gen_ai.response.model": "grok-2-image",
         "gen_ai.response.image.format": image_format,
-        "gen_ai.response.0.image.up_sampled_prompt": response.prompt,
+        "gen_ai.usage.input_tokens": response.usage.prompt_tokens,
+        "gen_ai.usage.output_tokens": response.usage.completion_tokens,
+        "gen_ai.usage.total_tokens": response.usage.total_tokens,
+        "gen_ai.usage.reasoning_tokens": response.usage.reasoning_tokens,
+        "gen_ai.usage.cached_prompt_text_tokens": response.usage.cached_prompt_text_tokens,
+        "gen_ai.usage.prompt_text_tokens": response.usage.prompt_text_tokens,
+        "gen_ai.usage.prompt_image_tokens": response.usage.prompt_image_tokens,
+        "gen_ai.response.0.image.up_sampled_prompt": "",
+        "gen_ai.response.0.image.respect_moderation": response.respect_moderation,
     }
 
     if image_format == "url":
@@ -102,7 +222,8 @@ def test_sample_creates_span_without_sensitive_attributes_when_disabled(
 
     expected_request_attributes = {
         "gen_ai.operation.name": "generate_image",
-        "gen_ai.system": "xai",
+        "gen_ai.provider.name": "xai",
+        "gen_ai.output.type": "image",
         "gen_ai.request.model": "grok-2-image",
     }
 
@@ -137,7 +258,8 @@ def test_sample_batch_creates_span_with_correct_attributes(
     expected_request_attributes = {
         "gen_ai.prompt": "A beautiful sunset",
         "gen_ai.operation.name": "generate_image",
-        "gen_ai.system": "xai",
+        "gen_ai.provider.name": "xai",
+        "gen_ai.output.type": "image",
         "gen_ai.request.model": "grok-2-image",
         "gen_ai.request.image.format": image_format,
         "gen_ai.request.image.count": 3,
@@ -153,9 +275,19 @@ def test_sample_batch_creates_span_with_correct_attributes(
     expected_response_attributes = {
         "gen_ai.response.model": "grok-2-image",
         "gen_ai.response.image.format": image_format,
-        "gen_ai.response.0.image.up_sampled_prompt": responses[0].prompt,
-        "gen_ai.response.1.image.up_sampled_prompt": responses[1].prompt,
-        "gen_ai.response.2.image.up_sampled_prompt": responses[2].prompt,
+        "gen_ai.usage.input_tokens": responses[0].usage.prompt_tokens,
+        "gen_ai.usage.output_tokens": responses[0].usage.completion_tokens,
+        "gen_ai.usage.total_tokens": responses[0].usage.total_tokens,
+        "gen_ai.usage.reasoning_tokens": responses[0].usage.reasoning_tokens,
+        "gen_ai.usage.cached_prompt_text_tokens": responses[0].usage.cached_prompt_text_tokens,
+        "gen_ai.usage.prompt_text_tokens": responses[0].usage.prompt_text_tokens,
+        "gen_ai.usage.prompt_image_tokens": responses[0].usage.prompt_image_tokens,
+        "gen_ai.response.0.image.up_sampled_prompt": "",
+        "gen_ai.response.1.image.up_sampled_prompt": "",
+        "gen_ai.response.2.image.up_sampled_prompt": "",
+        "gen_ai.response.0.image.respect_moderation": responses[0].respect_moderation,
+        "gen_ai.response.1.image.respect_moderation": responses[1].respect_moderation,
+        "gen_ai.response.2.image.respect_moderation": responses[2].respect_moderation,
     }
 
     if image_format == "url":
